@@ -42,6 +42,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/types.h>
 #include <rex/memory/utils.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
@@ -2272,6 +2273,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  rex::perf::FrameStatsScope swap_scope(rex::perf::FrameStatsScope::Sink::kSwapCost);
+  rex::perf::FrameStatsGuestSwap();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3593,6 +3596,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  rex::perf::FrameStatsDraws(1);
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
@@ -4970,9 +4974,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    VkResult wait_result;
+    {
+      rex::perf::FrameStatsScope gpu_wait_scope(rex::perf::FrameStatsScope::Sink::kGpuWait);
+      wait_result =
+          dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                              submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {

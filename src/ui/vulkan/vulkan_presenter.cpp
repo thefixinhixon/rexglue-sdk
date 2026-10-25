@@ -20,9 +20,11 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
@@ -2240,7 +2242,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+    uint64_t present_start = rex::chrono::Clock::QueryHostTickCount();
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+    rex::perf::FrameStatsPresent(
+        static_cast<double>(rex::chrono::Clock::QueryHostTickCount() - present_start) * 1000.0 /
+        static_cast<double>(rex::chrono::Clock::QueryHostTickFrequency()));
   }
   switch (present_result) {
     case VK_SUCCESS:
