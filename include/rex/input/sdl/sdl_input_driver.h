@@ -67,6 +67,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     DeviceId id;
     // Per pad rather than per guest user, so it survives reassignment.
     KeystrokeState keystroke;
+    // Last rumble the guest requested, for the stuck-rumble watchdog.
+    bool rumble_active;
+    uint64_t rumble_requested_ms;
   };
 
   // WindowListener

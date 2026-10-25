@@ -280,8 +280,8 @@ inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, con
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.{} = *({}*)REX_RAW_ADDR({});", ctx.reserved(), reserved_field, ptr_type,
-              ctx.ea());
+  ctx.println("\t{}.{} = __atomic_load_n(({}*)REX_RAW_ADDR({}), __ATOMIC_ACQUIRE);",
+              ctx.reserved(), reserved_field, ptr_type, ctx.ea());
   ctx.println("\t{}.u64 = {}({}.{});", ctx.r(ctx.insn.operands[0]), bswap_func, ctx.reserved(),
               reserved_field);
 }

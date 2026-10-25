@@ -35,6 +35,9 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(sh_no_vsync_vblank_fast, false, "GPU",
+                    "With vsync off, run the guest vblank at ~1 kHz instead of the video mode rate");
+
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
@@ -161,7 +164,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+              (REXCVAR_GET(vsync) || !REXCVAR_GET(sh_no_vsync_vblank_fast))
+                  ? vsync_interval_ticks
+                  : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;

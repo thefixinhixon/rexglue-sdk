@@ -22,6 +22,9 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+REXCVAR_DEFINE_INT32(sh_rumble_timeout_ms, 10000, "Input",
+                     "Stop controller rumble the guest has not refreshed for this many "
+                     "milliseconds (0 = never)");
 
 namespace rex::input::sdl {
 
@@ -207,6 +210,15 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  int32_t rumble_timeout_ms = REXCVAR_GET(sh_rumble_timeout_ms);
+  if (controller->rumble_active && rumble_timeout_ms > 0 &&
+      SDL_GetTicks() - controller->rumble_requested_ms > uint64_t(rumble_timeout_ms)) {
+    SDL_RumbleGamepad(controller->sdl, 0, 0, 0);
+    controller->rumble_active = false;
+    REXLOG_INFO("[sh-rumble] stopped rumble not refreshed for {} ms on device {}",
+                rumble_timeout_ms, static_cast<uint64_t>(controller->id));
+  }
+
   // Make sure packet_number is only incremented by 1, even if there have been
   // multiple updates between GetState calls. Also track `is_active` to
   // increment the packet number if it changed.
@@ -239,6 +251,8 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
   // XInput vibration holds until the guest changes it, but SDL rumble expires,
   // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
   // SDL's maximum instead; each call cancels the previous effect anyway.
+  controller->rumble_active = vibration->left_motor_speed || vibration->right_motor_speed;
+  controller->rumble_requested_ms = SDL_GetTicks();
   return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
                            vibration->right_motor_speed, kRumbleDurationMs)
              ? X_ERROR_SUCCESS
@@ -460,6 +474,8 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   // SDL_GetGamepadPlayerIndex is deliberately ignored: on Windows it reports
   // the XInput user index the OS assigned, which is unrelated to connection
   // order and leaves non-XInput pads unnumbered.
+  SDL_RumbleGamepad(controller, 0, 0, 0);
+
   ControllerState state = {};
   state.sdl = controller;
   state.id = AllocateDeviceId();

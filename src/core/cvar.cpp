@@ -322,7 +322,7 @@ ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Sou
   }
   entry.source = source;
 
-  if (entry.lifecycle == Lifecycle::kRequiresRestart) {
+  if (entry.lifecycle == Lifecycle::kRequiresRestart && source != Source::kConfig) {
     MarkPendingRestart(name);
   }
 
@@ -690,21 +690,101 @@ bool IsFinalized() {
   return g_finalized;
 }
 
-void SaveConfig(const std::filesystem::path& config_path) {
-  std::string content = SerializeToTOML();
-  if (content.empty()) {
-    REXLOG_DEBUG("SaveConfig: no modified flags to save");
-    return;
-  }
+namespace {
 
+void IndexTomlKeys(toml::table& table, const std::string& prefix,
+                   std::unordered_map<std::string, std::pair<toml::table*, std::string>>& index) {
+  for (auto& [key, value] : table) {
+    std::string full_key = prefix.empty() ? std::string(key) : prefix + "_" + std::string(key);
+    if (value.is_table()) {
+      IndexTomlKeys(*value.as_table(), full_key, index);
+    } else {
+      index[full_key] = {&table, std::string(key)};
+    }
+  }
+}
+
+void AssignTomlValue(toml::table& table, const std::string& key, FlagType type,
+                     const std::string& value) {
+  switch (type) {
+    case FlagType::Boolean:
+      table.insert_or_assign(key, value == "true" || value == "1");
+      break;
+    case FlagType::Int32:
+    case FlagType::Int64:
+    case FlagType::Uint32:
+    case FlagType::Uint64:
+      table.insert_or_assign(key, static_cast<int64_t>(std::stoll(value)));
+      break;
+    case FlagType::Double:
+      table.insert_or_assign(key, std::stod(value));
+      break;
+    default:
+      table.insert_or_assign(key, value);
+      break;
+  }
+}
+
+}  // namespace
+
+void SaveConfig(const std::filesystem::path& config_path) {
   try {
+    toml::table config;
+    bool existed = std::filesystem::exists(config_path);
+    if (existed) {
+      try {
+        config = toml::parse_file(config_path.string());
+      } catch (const toml::parse_error& err) {
+        REXLOG_ERROR("SaveConfig: failed to parse {}, not overwriting it: {}",
+                     config_path.string(), err.what());
+        return;
+      }
+    }
+
+    std::unordered_map<std::string, std::pair<toml::table*, std::string>> index;
+    IndexTomlKeys(config, "", index);
+
+    bool changed = false;
+    {
+      std::lock_guard lock(GetRegistryMutex());
+      for (const auto& entry : GetRegistryStorage()) {
+        if (entry.type == FlagType::Command) {
+          continue;
+        }
+        std::string value = entry.getter();
+        auto it = index.find(entry.name);
+        if (it != index.end()) {
+          AssignTomlValue(*it->second.first, it->second.second, entry.type, value);
+          changed = true;
+        } else if (value != entry.default_value && entry.source != Source::kCommandLine &&
+                   entry.source != Source::kEnvironment) {
+          AssignTomlValue(config, entry.name, entry.type, value);
+          changed = true;
+        }
+      }
+    }
+    if (!changed) {
+      REXLOG_DEBUG("SaveConfig: no modified flags to save");
+      return;
+    }
+
+    if (existed) {
+      std::filesystem::path backup_path = config_path;
+      backup_path += ".bak";
+      std::error_code ec;
+      std::filesystem::copy_file(config_path, backup_path,
+                                 std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        REXLOG_WARN("SaveConfig: failed to back up {}: {}", config_path.string(), ec.message());
+      }
+    }
+
     std::ofstream file(config_path);
     if (!file) {
       REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
       return;
     }
-    file << "# Auto-generated cvar configuration\n";
-    file << content;
+    file << config << "\n";
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());

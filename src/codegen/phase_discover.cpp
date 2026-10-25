@@ -13,9 +13,12 @@
 #include "decoded_binary.h"
 #include <rex/codegen/function_scanner.h>
 
+#include <algorithm>
 #include <array>
 #include <bitset>
+#include <limits>
 #include <unordered_set>
+#include <vector>
 
 #include <rex/codegen/phases.h>
 #include "phase_helpers.h"
@@ -190,6 +193,8 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
   }
 }
 
+size_t dataPointerScan(CodegenContext& ctx);
+
 void discoverAllFunctions(CodegenContext& ctx) {
   REXCODEGEN_TRACE("Analyze: starting iterative discovery...");
 
@@ -265,6 +270,18 @@ void discoverAllFunctions(CodegenContext& ctx) {
   }
 
   REXCODEGEN_TRACE("Analyze: {} total functions after vtable scan", graph.functionCount());
+
+  if (dataPointerScan(ctx) > 0) {
+    const size_t maxIterationsData = REXCVAR_GET(max_vtable_iterations);
+    for (size_t i = 0; i < maxIterationsData; ++i) {
+      lastFunctionCount = graph.functionCount();
+      auto knownFunctions = buildKnownFunctions(graph);
+      if (discoverPendingFunctions(ctx, knownFunctions) == 0)
+        break;
+      if (graph.functionCount() == lastFunctionCount)
+        break;
+    }
+  }
 }
 
 //=============================================================================
@@ -400,6 +417,66 @@ void functionPointerScan(CodegenContext& ctx) {
   }
 
   REXCODEGEN_TRACE("functionPointerScan: found {} new function pointer targets", foundCount);
+}
+
+//=============================================================================
+// Data Pointer Scan: find code addresses stored in data sections
+//=============================================================================
+bool isFunctionBoundary(uint32_t prev) {
+  if (prev == 0)
+    return true;
+  if (prev == 0x4E800020 || prev == 0x4E800420)
+    return true;
+  return (prev & 0xFC000003) == 0x48000000;
+}
+
+size_t dataPointerScan(CodegenContext& ctx) {
+  auto& graph = ctx.graph;
+  auto& binary = ctx.binary();
+
+  std::vector<std::pair<uint32_t, uint32_t>> bounds;
+  bounds.reserve(graph.functions().size());
+  for (const auto& [addr, node] : graph.functions()) {
+    bounds.emplace_back(addr, addr + node->size());
+  }
+  std::sort(bounds.begin(), bounds.end());
+
+  auto insideKnownFunction = [&](uint32_t addr) {
+    auto it = std::upper_bound(bounds.begin(), bounds.end(),
+                               std::make_pair(addr, std::numeric_limits<uint32_t>::max()));
+    if (it == bounds.begin())
+      return false;
+    --it;
+    return addr >= it->first && addr < it->second;
+  };
+
+  std::unordered_set<uint32_t> found;
+  for (const auto& section : binary.sections()) {
+    if (section.executable || !section.data)
+      continue;
+    for (uint32_t off = 0; off + 4 <= section.size; off += 4) {
+      uint32_t value = load_and_swap<uint32_t>(section.data + off);
+      if (value & 0x3)
+        continue;
+      if (!binary.isExecutable(value) || binary.isInImportExportRange(value))
+        continue;
+      if (graph.isEntryPoint(value) || found.contains(value))
+        continue;
+      if (insideKnownFunction(value))
+        continue;
+      const uint8_t* prev = binary.translate(value - 4);
+      if (prev && !isFunctionBoundary(load_and_swap<uint32_t>(prev)))
+        continue;
+      found.insert(value);
+    }
+  }
+
+  for (uint32_t addr : found) {
+    graph.addFunction(addr, 4, FunctionAuthority::DISCOVERED, true);
+  }
+
+  REXCODEGEN_INFO("dataPointerScan: {} new functions referenced from data", found.size());
+  return found.size();
 }
 
 }  // anonymous namespace

@@ -1498,7 +1498,21 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   }
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
     // Out of memory.
-    REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
+    uint32_t free_pages = 0;
+    uint32_t largest_free = 0;
+    uint32_t run = 0;
+    for (const auto& entry : page_table_) {
+      if (entry.state == 0) {
+        ++free_pages;
+        largest_free = std::max(largest_free, ++run);
+      } else {
+        run = 0;
+      }
+    }
+    REXSYS_ERROR(
+        "BaseHeap::Alloc failed to find contiguous range: heap {:08X}+{:08X} request {:08X} "
+        "bytes ({} pages, align {:X}), free {} pages, largest free run {} pages",
+        heap_base_, heap_size_, size, page_count, alignment, free_pages, largest_free);
     assert_always("Heap exhausted!");
     return false;
   }
