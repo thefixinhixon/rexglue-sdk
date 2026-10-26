@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include <rex/perf/frame_stats.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -301,6 +302,8 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kUploads, 1);
+      rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kUploadBytes, upload_buffer_size);
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);

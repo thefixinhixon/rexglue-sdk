@@ -89,6 +89,18 @@ class FrameStatsScope {
   bool active_;
 };
 
+// Per-frame event counters for the [sh-perf] "gpu memory" line.
+enum class FrameStatsCounter : uint32_t {
+  kUploads,
+  kUploadBytes,
+  kInvalidations,
+  kInvalidatedBytes,
+  kIndexConversions,
+  kIndexConvertedBytes,
+  kCount,
+};
+void FrameStatsCount(FrameStatsCounter counter, uint64_t value);
+
 // Splits the time of one draw into phases for the [sh-perf] "draw phases"
 // line. Mark(p) charges the time since the previous mark to phase p; the
 // destructor charges the rest to the last phase.

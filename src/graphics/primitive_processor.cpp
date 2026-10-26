@@ -14,6 +14,7 @@
 #include <functional>
 #include <utility>
 
+#include <rex/perf/frame_stats.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -1345,6 +1346,8 @@ PrimitiveProcessor::CacheTransaction::CacheTransaction(PrimitiveProcessor& proce
       result_ = processor_.cache_entry_pool_[cache_map_it->second].result;
       result_type_ = ResultType::kExisting;
     } else {
+      rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kIndexConversions, 1);
+      rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kIndexConvertedBytes, size_bytes);
       // Inhibit writing the new result if the range happens to be modified
       // during the processing outside the lock.
       processor_.cache_currently_processing_base_ = key_.base;

@@ -64,6 +64,7 @@ struct Accumulators {
   std::atomic<uint64_t> pipeline_us[3];
   std::atomic<uint64_t> pipeline_max_us[3];
   std::atomic<uint64_t> draw_phase_ticks[FrameStatsDrawPhases::kCount];
+  std::atomic<uint64_t> counters[uint32_t(FrameStatsCounter::kCount)];
   // Type 3 opcode is 7 bits wide.
   std::atomic<uint64_t> packet_us[128];
 };
@@ -207,6 +208,15 @@ void MaybeLog() {
         phase_ms(0), phase_ms(1), phase_ms(2), phase_ms(3), phase_ms(4), phase_ms(5), phase_ms(6),
         phase_ms(7));
   }
+  uint64_t counters[uint32_t(FrameStatsCounter::kCount)];
+  for (uint32_t i = 0; i < uint32_t(FrameStatsCounter::kCount); ++i) {
+    counters[i] = g_acc.counters[i].exchange(0, std::memory_order_relaxed);
+  }
+  REXLOG_INFO(
+      "[sh-perf] gpu memory per frame: uploads {:.1f} {:.1f}KB | invalidations {:.1f} {:.1f}KB | "
+      "index conversions {:.1f} {:.1f}KB",
+      counters[0] / frames, counters[1] / frames / 1024.0, counters[2] / frames,
+      counters[3] / frames / 1024.0, counters[4] / frames, counters[5] / frames / 1024.0);
   if (pipeline_count[0] || pipeline_count[1] || pipeline_count[2]) {
     REXLOG_INFO(
         "[sh-perf] cp pipeline work: translate {} {:.1f}ms (max {:.1f}) | placeholder {} "
@@ -341,6 +351,13 @@ void FrameStatsSubmit(double cost_ms) {
   }
   g_acc.submits.fetch_add(1, std::memory_order_relaxed);
   g_acc.submit_us.fetch_add(static_cast<uint64_t>(cost_ms * 1000.0), std::memory_order_relaxed);
+}
+
+void FrameStatsCount(FrameStatsCounter counter, uint64_t value) {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.counters[uint32_t(counter)].fetch_add(value, std::memory_order_relaxed);
 }
 
 FrameStatsDrawPhases::FrameStatsDrawPhases() {

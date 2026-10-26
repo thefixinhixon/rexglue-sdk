@@ -18,7 +18,13 @@
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
+#include <rex/cvar.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/memory.h>
+
+REXCVAR_DEFINE_BOOL(sh_gpu_invalidation_exact, false, "GPU",
+                    "Invalidate only the written pages of GPU-visible guest memory instead of "
+                    "widening to up to 256 KB around the write");
 
 namespace rex::graphics {
 
@@ -494,7 +500,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   auto global_lock = global_critical_region_.Acquire();
 
-  if (!exact_range) {
+  if (!exact_range && !REXCVAR_GET(sh_gpu_invalidation_exact)) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
     // invalidated - if no GPU-written data nearby that was not intended to be
     // invalidated since it's not in sync with CPU memory and can't be
@@ -529,6 +535,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   }
 
   FireWatches(page_first, page_last, false);
+  rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kInvalidations, 1);
+  rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kInvalidatedBytes,
+                             uint64_t(page_last - page_first + 1) << page_size_log2_);
 
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
