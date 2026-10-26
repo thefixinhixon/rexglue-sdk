@@ -267,6 +267,14 @@ static sem_t* RexCreateAnonymousSemaphore() {
 }
 #endif  // __APPLE__
 
+// A wait on several objects can't block on any one object's condition
+// variable, so every signal also bumps a shared epoch (only while someone is in
+// WaitMultiple) and multi-object waiters sleep on that instead of polling.
+static std::mutex g_multi_wait_mutex;
+static std::condition_variable g_multi_wait_cond;
+static uint64_t g_multi_wait_epoch = 0;
+static std::atomic<uint32_t> g_multi_waiters{0};
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -335,7 +343,17 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    g_multi_waiters.fetch_add(1, std::memory_order_seq_cst);
+    struct MultiWaiterGuard {
+      ~MultiWaiterGuard() { g_multi_waiters.fetch_sub(1, std::memory_order_seq_cst); }
+    } multi_waiter_guard;
+
     while (true) {
+      uint64_t epoch;
+      {
+        std::lock_guard<std::mutex> epoch_lock(g_multi_wait_mutex);
+        epoch = g_multi_wait_epoch;
+      }
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -406,17 +424,12 @@ class PosixConditionBase {
 
       locks.clear();
 
-      auto now = std::chrono::steady_clock::now();
-      if (now >= end_time) {
-        return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
-      }
-
+      std::unique_lock<std::mutex> wait_lock(g_multi_wait_mutex);
+      auto epoch_changed = [epoch] { return g_multi_wait_epoch != epoch; };
       if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
+        g_multi_wait_cond.wait(wait_lock, epoch_changed);
+      } else if (!g_multi_wait_cond.wait_until(wait_lock, end_time, epoch_changed)) {
+        return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
     }
   }
@@ -428,6 +441,17 @@ class PosixConditionBase {
  protected:
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+  // Wakes waiters on this object and any WaitMultiple that might include it.
+  void NotifyAll() {
+    cond_.notify_all();
+    if (g_multi_waiters.load(std::memory_order_seq_cst)) {
+      {
+        std::lock_guard<std::mutex> epoch_lock(g_multi_wait_mutex);
+        ++g_multi_wait_epoch;
+      }
+      g_multi_wait_cond.notify_all();
+    }
+  }
   std::condition_variable cond_;
   std::mutex mutex_;
 };
@@ -449,7 +473,7 @@ class PosixCondition<Event> : public PosixConditionBase {
   bool Signal() override {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyAll();
     return true;
   }
 
@@ -486,7 +510,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    cond_.notify_all();
+    NotifyAll();
     return true;
   }
 
@@ -494,7 +518,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   inline bool signaled() const override { return count_ > 0; }
   inline void post_execution() override {
     count_--;
-    cond_.notify_all();
+    NotifyAll();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -518,7 +542,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
-        cond_.notify_all();
+        NotifyAll();
       }
       return true;
     }
@@ -550,7 +574,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
   bool Signal() override {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyAll();
     return true;
   }
 
@@ -978,7 +1002,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
       exit_code_ = exit_code;
       signaled_ = true;
-      cond_.notify_all();
+      NotifyAll();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1106,7 +1130,7 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
   if (deadline == std::chrono::steady_clock::time_point::max()) {
     return kAlertablePollSlice;
   }
-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+  auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
       deadline - std::chrono::steady_clock::now());
   if (remaining <= std::chrono::milliseconds::zero()) {
     return std::chrono::milliseconds::zero();
@@ -1448,7 +1472,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
-    thread->handle_.cond_.notify_all();
+    thread->handle_.NotifyAll();
   }
 
   current_thread_ = nullptr;
