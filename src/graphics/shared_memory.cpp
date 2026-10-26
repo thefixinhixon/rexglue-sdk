@@ -293,7 +293,11 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_last = valid_page_last >> 6;
 
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = [&] {
+      rex::perf::FrameStatsCounterTimer lock_wait(
+          rex::perf::FrameStatsCounter::kLockWaitTicks);
+      return global_critical_region_.Acquire();
+    }();
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
@@ -405,7 +409,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     upload_ranges_.emplace_back(page_start, page_count);
   };
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = [&] {
+      rex::perf::FrameStatsCounterTimer lock_wait(
+          rex::perf::FrameStatsCounter::kLockWaitTicks);
+      return global_critical_region_.Acquire();
+    }();
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
       uint32_t page_first = range.first >> page_size_log2_;
       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;

@@ -274,6 +274,7 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kUploadCalls, 1);
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,

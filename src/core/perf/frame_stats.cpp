@@ -21,12 +21,15 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cinttypes>
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 
 REXCVAR_DEFINE_BOOL(sh_perf_log, false, "Performance",
                     "Log guest/host frame rates, command processor time and GPU wait time");
@@ -73,6 +76,25 @@ Accumulators g_acc;
 
 std::atomic<bool> g_enabled{false};
 std::atomic<uint64_t> g_last_log_tick{0};
+
+size_t CountMappings() {
+#if REX_PLATFORM_GNU_LINUX
+  FILE* maps = std::fopen("/proc/self/maps", "r");
+  if (!maps) {
+    return 0;
+  }
+  size_t lines = 0;
+  char buffer[65536];
+  size_t read;
+  while ((read = std::fread(buffer, 1, sizeof(buffer), maps)) != 0) {
+    lines += size_t(std::count(buffer, buffer + read, '\n'));
+  }
+  std::fclose(maps);
+  return lines;
+#else
+  return 0;
+#endif
+}
 
 uint64_t ToMicroseconds(uint64_t ticks) {
   uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
@@ -217,6 +239,19 @@ void MaybeLog() {
       "index conversions {:.1f} {:.1f}KB",
       counters[0] / frames, counters[1] / frames / 1024.0, counters[2] / frames,
       counters[3] / frames / 1024.0, counters[4] / frames, counters[5] / frames / 1024.0);
+  auto counter_ms = [&](FrameStatsCounter c) {
+    return static_cast<double>(ToMicroseconds(counters[uint32_t(c)])) / frames / 1000.0;
+  };
+  auto counter_per_frame = [&](FrameStatsCounter c) { return counters[uint32_t(c)] / frames; };
+  REXLOG_INFO(
+      "[sh-perf] upload overhead per frame: upload calls {:.1f} | protect {:.1f} calls {:.2f}ms | "
+      "guest faults {:.1f} {:.2f}ms | lock wait {:.2f}ms | vmas {}",
+      counter_per_frame(FrameStatsCounter::kUploadCalls),
+      counter_per_frame(FrameStatsCounter::kProtectCalls),
+      counter_ms(FrameStatsCounter::kProtectTicks),
+      counter_per_frame(FrameStatsCounter::kGuestFaults),
+      counter_ms(FrameStatsCounter::kGuestFaultTicks),
+      counter_ms(FrameStatsCounter::kLockWaitTicks), CountMappings());
   if (pipeline_count[0] || pipeline_count[1] || pipeline_count[2]) {
     REXLOG_INFO(
         "[sh-perf] cp pipeline work: translate {} {:.1f}ms (max {:.1f}) | placeholder {} "
@@ -358,6 +393,19 @@ void FrameStatsCount(FrameStatsCounter counter, uint64_t value) {
     return;
   }
   g_acc.counters[uint32_t(counter)].fetch_add(value, std::memory_order_relaxed);
+}
+
+FrameStatsCounterTimer::FrameStatsCounterTimer(FrameStatsCounter counter) : counter_(counter) {
+  active_ = g_enabled.load(std::memory_order_relaxed);
+  start_tick_ = active_ ? rex::chrono::Clock::QueryHostTickCount() : 0;
+}
+
+FrameStatsCounterTimer::~FrameStatsCounterTimer() {
+  if (!active_) {
+    return;
+  }
+  g_acc.counters[uint32_t(counter_)].fetch_add(
+      rex::chrono::Clock::QueryHostTickCount() - start_tick_, std::memory_order_relaxed);
 }
 
 FrameStatsDrawPhases::FrameStatsDrawPhases() {

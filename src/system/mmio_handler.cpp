@@ -14,14 +14,21 @@
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/exception_handler.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
 using namespace rex::arch;
+
+
+REXCVAR_DEFINE_BOOL(sh_fault_skip_protect_query, true, "Memory",
+                    "Linux: don't re-read /proc/self/maps on every write-watch fault (the "
+                    "access violation callback already handles a watch another thread cleared)");
 
 namespace rex::runtime {
 
@@ -405,14 +412,25 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // Recheck if the pages are still protected (race condition - another thread
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
+    rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kGuestFaults, 1);
+    rex::perf::FrameStatsCounterTimer fault_timer(rex::perf::FrameStatsCounter::kGuestFaultTicks);
     auto lock = global_critical_region_.Acquire();
-    memory::PageAccess cur_access;
-    size_t page_length = memory::page_size();
-    memory::QueryProtect(fault_host_address, page_length, cur_access);
-    if (cur_access != memory::PageAccess::kNoAccess &&
-        (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
-      // Another thread has cleared this watch. Abort.
-      return true;
+#if REX_PLATFORM_LINUX
+    // QueryProtect parses all of /proc/self/maps on Linux, under the global
+    // lock the GPU command processor also needs.
+    bool query_protect = !REXCVAR_GET(sh_fault_skip_protect_query);
+#else
+    bool query_protect = true;
+#endif
+    if (query_protect) {
+      memory::PageAccess cur_access;
+      size_t page_length = memory::page_size();
+      memory::QueryProtect(fault_host_address, page_length, cur_access);
+      if (cur_access != memory::PageAccess::kNoAccess &&
+          (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
+        // Another thread has cleared this watch. Abort.
+        return true;
+      }
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.

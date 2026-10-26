@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -24,6 +25,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
@@ -609,10 +611,17 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
                                rex::memory::PageAccess::kReadWrite, nullptr)) {
-        REXSYS_WARN(
-            "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
-            "guest_protect {:08X})",
-            virtual_address, static_cast<uint64_t>(page_base), guest_protect);
+        // Also reached, many times per frame, when another thread already
+        // cleared the watch of this page while this fault waited for the lock
+        // (Linux skips the protection query, see sh_fault_skip_protect_query).
+        static std::atomic<uint64_t> recovered_count{0};
+        uint64_t count = ++recovered_count;
+        if (count <= 8 || !(count & (count - 1))) {
+          REXSYS_WARN(
+              "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
+              "guest_protect {:08X}), {} times so far",
+              virtual_address, static_cast<uint64_t>(page_base), guest_protect, count);
+        }
         return true;
       }
     }
@@ -682,6 +691,7 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle)
 void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                                  bool enable_invalidation_notifications,
                                                  bool enable_data_providers) {
+  rex::perf::FrameStatsCounterTimer protect_timer(rex::perf::FrameStatsCounter::kProtectTicks);
   heaps_.vA0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vC0000000.EnableAccessCallbacks(physical_address, length,
@@ -2173,6 +2183,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       }
     } else {
       if (protect_system_page_first != UINT32_MAX) {
+        rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kProtectCalls, 1);
         rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                              (i - protect_system_page_first) * system_page_size_, protect_access);
         protect_system_page_first = UINT32_MAX;
@@ -2180,6 +2191,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     }
   }
   if (protect_system_page_first != UINT32_MAX) {
+    rex::perf::FrameStatsCount(rex::perf::FrameStatsCounter::kProtectCalls, 1);
     rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          protect_access);

@@ -97,9 +97,32 @@ enum class FrameStatsCounter : uint32_t {
   kInvalidatedBytes,
   kIndexConversions,
   kIndexConvertedBytes,
+  // Upload overhead breakdown for the [sh-perf] "upload overhead" line. The
+  // *Ticks counters hold host clock ticks.
+  kUploadCalls,
+  kProtectCalls,
+  kProtectTicks,
+  kGuestFaults,
+  kGuestFaultTicks,
+  kLockWaitTicks,
   kCount,
 };
 void FrameStatsCount(FrameStatsCounter counter, uint64_t value);
+
+// RAII timer adding the elapsed host ticks to a *Ticks counter.
+class FrameStatsCounterTimer {
+ public:
+  explicit FrameStatsCounterTimer(FrameStatsCounter counter);
+  ~FrameStatsCounterTimer();
+
+  FrameStatsCounterTimer(const FrameStatsCounterTimer&) = delete;
+  FrameStatsCounterTimer& operator=(const FrameStatsCounterTimer&) = delete;
+
+ private:
+  FrameStatsCounter counter_;
+  uint64_t start_tick_;
+  bool active_;
+};
 
 // Splits the time of one draw into phases for the [sh-perf] "draw phases"
 // line. Mark(p) charges the time since the previous mark to phase p; the
