@@ -3605,6 +3605,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   rex::perf::FrameStatsDraws(1);
   rex::perf::FrameStatsScope draw_scope(rex::perf::FrameStatsScope::Sink::kDraw);
+  rex::perf::FrameStatsDrawPhases draw_phases;
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
@@ -3723,6 +3724,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!primitive_processor_->Process(primitive_processing_result)) {
       return draw_fail("primitive_processing");
     }
+    draw_phases.Mark(rex::perf::FrameStatsDrawPhases::kPrimitive);
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
       return true;
@@ -3782,6 +3784,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                          pixel_shader_translation)) {
       return draw_fail("shader_translation");
     }
+    draw_phases.Mark(rex::perf::FrameStatsDrawPhases::kShaders);
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
     // modification, so if on the second iteration of this loop it becomes
@@ -3861,6 +3864,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  draw_phases.Mark(rex::perf::FrameStatsDrawPhases::kTextures);
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
@@ -3868,6 +3872,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
+  draw_phases.Mark(rex::perf::FrameStatsDrawPhases::kRenderTargets);
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
@@ -3926,6 +3931,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
+
+  draw_phases.Mark(rex::perf::FrameStatsDrawPhases::kPipeline);
 
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
@@ -4001,6 +4008,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!UpdateBindings(vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
   }
+  draw_phases.Mark(rex::perf::FrameStatsDrawPhases::kBindings);
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
@@ -4136,6 +4144,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
+  draw_phases.Mark(rex::perf::FrameStatsDrawPhases::kVertexMemory);
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());

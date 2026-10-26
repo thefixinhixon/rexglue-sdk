@@ -89,4 +89,34 @@ class FrameStatsScope {
   bool active_;
 };
 
+// Splits the time of one draw into phases for the [sh-perf] "draw phases"
+// line. Mark(p) charges the time since the previous mark to phase p; the
+// destructor charges the rest to the last phase.
+class FrameStatsDrawPhases {
+ public:
+  enum Phase : uint32_t {
+    kPrimitive,
+    kShaders,
+    kTextures,
+    kRenderTargets,
+    kPipeline,
+    kBindings,
+    kVertexMemory,
+    kSubmit,
+    kCount,
+  };
+
+  FrameStatsDrawPhases();
+  ~FrameStatsDrawPhases();
+
+  void Mark(Phase phase);
+
+  FrameStatsDrawPhases(const FrameStatsDrawPhases&) = delete;
+  FrameStatsDrawPhases& operator=(const FrameStatsDrawPhases&) = delete;
+
+ private:
+  uint64_t last_tick_;
+  bool active_;
+};
+
 }  // namespace rex::perf

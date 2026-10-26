@@ -63,6 +63,7 @@ struct Accumulators {
   std::atomic<uint64_t> pipeline_count[3];
   std::atomic<uint64_t> pipeline_us[3];
   std::atomic<uint64_t> pipeline_max_us[3];
+  std::atomic<uint64_t> draw_phase_ticks[FrameStatsDrawPhases::kCount];
   // Type 3 opcode is 7 bits wide.
   std::atomic<uint64_t> packet_us[128];
 };
@@ -189,6 +190,22 @@ void MaybeLog() {
   }
   if (!packets.empty()) {
     REXLOG_INFO("[sh-perf] cp packets per frame: {}", packets);
+  }
+  uint64_t phase_ticks[FrameStatsDrawPhases::kCount];
+  uint64_t phase_total = 0;
+  for (uint32_t i = 0; i < FrameStatsDrawPhases::kCount; ++i) {
+    phase_ticks[i] = g_acc.draw_phase_ticks[i].exchange(0, std::memory_order_relaxed);
+    phase_total += phase_ticks[i];
+  }
+  if (phase_total) {
+    auto phase_ms = [&](uint32_t i) {
+      return static_cast<double>(ToMicroseconds(phase_ticks[i])) / frames / 1000.0;
+    };
+    REXLOG_INFO(
+        "[sh-perf] draw phases per frame: primitive {:.2f}ms shaders {:.2f}ms textures {:.2f}ms "
+        "rt {:.2f}ms pipeline {:.2f}ms bindings {:.2f}ms vmem {:.2f}ms submit {:.2f}ms",
+        phase_ms(0), phase_ms(1), phase_ms(2), phase_ms(3), phase_ms(4), phase_ms(5), phase_ms(6),
+        phase_ms(7));
   }
   if (pipeline_count[0] || pipeline_count[1] || pipeline_count[2]) {
     REXLOG_INFO(
@@ -324,6 +341,24 @@ void FrameStatsSubmit(double cost_ms) {
   }
   g_acc.submits.fetch_add(1, std::memory_order_relaxed);
   g_acc.submit_us.fetch_add(static_cast<uint64_t>(cost_ms * 1000.0), std::memory_order_relaxed);
+}
+
+FrameStatsDrawPhases::FrameStatsDrawPhases() {
+  active_ = g_enabled.load(std::memory_order_relaxed);
+  last_tick_ = active_ ? rex::chrono::Clock::QueryHostTickCount() : 0;
+}
+
+FrameStatsDrawPhases::~FrameStatsDrawPhases() {
+  Mark(kSubmit);
+}
+
+void FrameStatsDrawPhases::Mark(Phase phase) {
+  if (!active_) {
+    return;
+  }
+  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  g_acc.draw_phase_ticks[phase].fetch_add(now - last_tick_, std::memory_order_relaxed);
+  last_tick_ = now;
 }
 
 FrameStatsScope::FrameStatsScope(Sink sink) : sink_(sink) {
