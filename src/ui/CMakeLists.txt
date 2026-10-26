@@ -121,8 +121,11 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
+# The spatial CAS/FSR presenter effects use the precompiled shaders in
+# src/ui/shaders and need neither the FidelityFX SDK nor its runtime; only the
+# temporal fsr2/fsr3 path does (REX_HAS_FIDELITYFX_RUNTIME).
+target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
 if(TARGET amd_fidelityfx_vk)
