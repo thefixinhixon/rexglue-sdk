@@ -13,6 +13,8 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <cstdint>
+
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -22,6 +24,13 @@
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
+
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
+
+#include <rex/platform/env.h>
 
 namespace rex::runtime {
 
@@ -34,9 +43,50 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 
 }  // namespace
 
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+static void LogHostBacktrace() {
+  void* frames[64];
+  const int frame_count = backtrace(frames, 64);
+  Dl_info image_info{};
+  uintptr_t image_base = 0;
+  if (frame_count > 0 && dladdr(frames[0], &image_info)) {
+    image_base = reinterpret_cast<uintptr_t>(image_info.dli_fbase);
+  }
+  REXLOG_ERROR("[sh-uf] host backtrace (image base 0x{:016X}):", image_base);
+  for (int i = 0; i < frame_count; ++i) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(frames[i]);
+    Dl_info frame_info{};
+    const char* symbol = "?";
+    uintptr_t image_offset = 0;
+    if (dladdr(frames[i], &frame_info)) {
+      if (frame_info.dli_sname) {
+        symbol = frame_info.dli_sname;
+      }
+      if (frame_info.dli_fbase && image_base) {
+        image_offset = address - image_base;
+      }
+    }
+    REXLOG_ERROR("[sh-uf]   #{:02d} 0x{:016X} +0x{:X} {}", i, address, image_offset, symbol);
+  }
+}
+#endif
+
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  static uint32_t invalid_call_count = 0;
+  const uint32_t target = ctx.last_indirect_target;
+  ++invalid_call_count;
+  if (invalid_call_count <= 64 || (invalid_call_count & 1023) == 0) {
+    REXLOG_ERROR("[sh-uf] call {} to invalid or unregistered function at guest address 0x{:08X}",
+                 invalid_call_count, target);
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+    LogHostBacktrace();
+#endif
+  }
+  if (rex::platform::env::get("REX_SH_UF_CONTINUE")) {
+    REXLOG_WARN("[sh-uf] REX_SH_UF_CONTINUE: continuing past invalid call to 0x{:08X}", target);
+    return;
+  }
+  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}", target);
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
