@@ -86,6 +86,17 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+  // With vulkan_async_shaders_nonblocking, nothing on the command processor
+  // thread waits for shader translation or pipeline creation: missing
+  // translations are queued for the translation threads (kPending, the draw
+  // should be skipped), and new pipelines are only queued for the creation
+  // threads (no placeholder pipeline is created; the pipeline reports itself as
+  // a placeholder with a null handle until the real one exists).
+  bool IsNonblockingShaderCompilation() const;
+  enum class TranslationRequestResult { kReady, kPending, kFailed };
+  TranslationRequestResult RequestShadersTranslated(
+      VulkanShader::VulkanTranslation* vertex_shader,
+      VulkanShader::VulkanTranslation* pixel_shader);
   // TODO(Triang3l): Return a deferred creation handle.
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
@@ -331,6 +342,12 @@ class VulkanPipelineCache {
   // Can be called from multiple threads.
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
+  // Binding layout UIDs of a translated shader. Command processor thread only
+  // (shares the layout maps with pipeline layout creation).
+  void SetUpShaderBindingLayoutUIDs(VulkanShader& shader);
+  void TranslationThread(size_t thread_index);
+  // Blocks until the translation threads have no queued or running work.
+  void WaitForTranslationThreadsIdle();
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
@@ -468,6 +485,18 @@ class VulkanPipelineCache {
   bool creation_completion_set_event_ = false;
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+
+  // Background shader translation. All translations of one shader go to the
+  // same thread (by ucode hash): the first translation of a shader fills the
+  // shader-wide bindings, and a concurrent one could finish before that.
+  std::mutex translation_request_lock_;
+  std::condition_variable translation_request_cond_;
+  std::condition_variable translation_completion_cond_;
+  std::vector<std::deque<VulkanShader::VulkanTranslation*>> translation_queues_;
+  size_t translation_pending_count_ = 0;
+  bool translation_threads_shutdown_ = false;
+  std::vector<std::unique_ptr<SpirvShaderTranslator>> translation_thread_translators_;
+  std::vector<std::unique_ptr<rex::thread::Thread>> translation_threads_;
 };
 
 }  // namespace rex::graphics::vulkan

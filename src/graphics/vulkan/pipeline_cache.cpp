@@ -31,6 +31,7 @@
 #include <rex/math.h>
 #include <rex/thread.h>
 #include <rex/memory.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline_util.h>
@@ -53,6 +54,19 @@ REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
     "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
     .range(-1, 32)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(vulkan_async_shaders_nonblocking, true, "GPU/Vulkan",
+                    "With async_shader_compilation, never block the command processor on shaders: "
+                    "translate shaders and create pipelines on background threads and skip draws "
+                    "until they are ready (no placeholder pipelines, no waiting at the end of a "
+                    "submission)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_shader_translation_threads, 2, "GPU/Vulkan",
+                     "Number of background shader translation threads for "
+                     "vulkan_async_shaders_nonblocking")
+    .range(1, 16)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
@@ -382,6 +396,28 @@ bool VulkanPipelineCache::Initialize() {
       assert_not_null(creation_thread);
       creation_thread->set_name("Vulkan Pipelines");
       creation_threads_.push_back(std::move(creation_thread));
+    }
+  }
+
+  if (!creation_threads_.empty()) {
+    size_t translation_thread_count =
+        std::min(size_t(REXCVAR_GET(vulkan_shader_translation_threads)),
+                 size_t(logical_processor_count));
+    translation_threads_shutdown_ = false;
+    translation_pending_count_ = 0;
+    translation_queues_.resize(translation_thread_count);
+    for (size_t i = 0; i < translation_thread_count; ++i) {
+      translation_thread_translators_.push_back(std::make_unique<SpirvShaderTranslator>(
+          SpirvShaderTranslator::Features(vulkan_device),
+          render_target_cache_.msaa_2x_attachments_supported(),
+          render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
+          render_target_cache_.draw_resolution_scale_x(),
+          render_target_cache_.draw_resolution_scale_y()));
+      std::unique_ptr<rex::thread::Thread> translation_thread =
+          rex::thread::Thread::Create({}, [this, i]() { TranslationThread(i); });
+      assert_not_null(translation_thread);
+      translation_thread->set_name("Vulkan Shader Translation");
+      translation_threads_.push_back(std::move(translation_thread));
     }
   }
 
@@ -765,7 +801,7 @@ void VulkanPipelineCache::EndSubmission() {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading = startup_loading_;
     }
-    if (startup_loading) {
+    if (startup_loading || IsNonblockingShaderCompilation()) {
       creation_request_cond_.notify_one();
     } else {
       // Help worker threads on the processor thread to reduce warm-up latency.
@@ -792,6 +828,22 @@ void VulkanPipelineCache::EndSubmission() {
 }
 
 void VulkanPipelineCache::Shutdown() {
+  // Shut down translation threads before destroying any shaders they may touch.
+  if (!translation_threads_.empty()) {
+    {
+      std::lock_guard<std::mutex> lock(translation_request_lock_);
+      translation_threads_shutdown_ = true;
+    }
+    translation_request_cond_.notify_all();
+    for (size_t i = 0; i < translation_threads_.size(); ++i) {
+      rex::thread::Wait(translation_threads_[i].get(), false);
+    }
+    translation_threads_.clear();
+    translation_thread_translators_.clear();
+    translation_queues_.clear();
+    translation_pending_count_ = 0;
+  }
+
   // Shut down creation threads before destroying any pipelines they may touch.
   if (!creation_threads_.empty()) {
     {
@@ -1018,7 +1070,14 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
               register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
+  if (!translation_threads_.empty() &&
+      (!vertex_shader->is_translated() || (pixel_shader && !pixel_shader->is_translated()))) {
+    // A translation thread may be translating these (or other modifications of
+    // the same shaders, which share the binding setup).
+    WaitForTranslationThreadsIdle();
+  }
   if (!vertex_shader->is_translated()) {
+    rex::perf::FrameStatsScope translate_scope(rex::perf::FrameStatsScope::Sink::kShaderTranslate);
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
     if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
@@ -1031,6 +1090,8 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   }
   if (pixel_shader != nullptr) {
     if (!pixel_shader->is_translated()) {
+      rex::perf::FrameStatsScope translate_scope(
+          rex::perf::FrameStatsScope::Sink::kShaderTranslate);
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
@@ -1128,7 +1189,20 @@ bool VulkanPipelineCache::ConfigurePipeline(
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    if (found_pipeline == VK_NULL_HANDLE &&
+        it->second.is_placeholder.load(std::memory_order_acquire) &&
+        IsNonblockingShaderCompilation()) {
+      // Still being created by a creation thread - the caller skips the draw.
+      last_pipeline_ = &*it;
+      pipeline_out = VK_NULL_HANDLE;
+      pipeline_layout_out = it->second.pipeline_layout.load(std::memory_order_acquire);
+      if (pipeline_handle_out) {
+        *pipeline_handle_out = &it->second;
+      }
+      return true;
+    }
     if (found_pipeline == VK_NULL_HANDLE) {
+      rex::perf::FrameStatsScope sync_scope(rex::perf::FrameStatsScope::Sink::kSyncPipeline);
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
           !EnsurePipelineCreated(creation_arguments)) {
@@ -1157,13 +1231,35 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   bool queued_async_creation = false;
-  if (use_async) {
+  if (IsNonblockingShaderCompilation()) {
+    uint32_t shader_writes_color_targets =
+        pixel_shader ? pixel_shader->shader().writes_color_targets() : 0;
+    bool shader_writes_depth = pixel_shader ? pixel_shader->shader().writes_depth()
+                                            : normalized_depth_control.z_write_enable != 0;
+    creation_arguments_real.priority = pipeline_util::CalculatePipelinePriority(
+        pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask),
+        shader_writes_color_targets, shader_writes_depth);
+    pipeline.second.is_placeholder.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queue_.push(creation_arguments_real);
+    }
+    creation_request_cond_.notify_one();
+    queued_async_creation = true;
+  } else if (use_async) {
     creation_arguments_real.priority = async_priority;
     PipelineCreationArguments creation_arguments_placeholder;
     if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
                                                       creation_arguments_placeholder, true)) {
       pipeline.second.is_placeholder.store(true, std::memory_order_release);
-      if (EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_)) {
+      bool placeholder_created;
+      {
+        rex::perf::FrameStatsScope placeholder_scope(
+            rex::perf::FrameStatsScope::Sink::kPlaceholderPipeline);
+        placeholder_created =
+            EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_);
+      }
+      if (placeholder_created) {
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
           creation_queue_.push(creation_arguments_real);
@@ -1176,9 +1272,12 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
   }
 
-  if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
-    pipelines_.erase(description);
-    return false;
+  if (!queued_async_creation) {
+    rex::perf::FrameStatsScope sync_scope(rex::perf::FrameStatsScope::Sink::kSyncPipeline);
+    if (!EnsurePipelineCreated(creation_arguments_real)) {
+      pipelines_.erase(description);
+      return false;
+    }
   }
   if (!queued_async_creation) {
     pipeline.second.is_placeholder.store(false, std::memory_order_release);
@@ -1201,6 +1300,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
   pipeline_layout_out = pipeline.second.pipeline_layout.load(std::memory_order_acquire);
   if (pipeline_handle_out) {
     *pipeline_handle_out = &pipeline.second;
+  }
+  if (pipeline_out == VK_NULL_HANDLE && queued_async_creation &&
+      pipeline.second.is_placeholder.load(std::memory_order_acquire)) {
+    // Queued without a placeholder - the caller skips the draw.
+    return true;
   }
   return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
 }
@@ -1249,6 +1353,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   // TODO(Triang3l): Log that the shader has been successfully translated in
   // common code.
 
+  SetUpShaderBindingLayoutUIDs(shader);
+  return true;
+}
+
+void VulkanPipelineCache::SetUpShaderBindingLayoutUIDs(VulkanShader& shader) {
   // Set up the texture binding layout.
   if (shader.EnterBindingLayoutUserUIDSetup()) {
     // Obtain the unique IDs of the binding layout if there are any texture
@@ -1297,8 +1406,101 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
                   "UID is their count");
     shader.SetSamplerBindingLayoutUserUID(shader.GetSamplerBindingsAfterTranslation().size());
   }
+}
 
-  return true;
+bool VulkanPipelineCache::IsNonblockingShaderCompilation() const {
+  return REXCVAR_GET(async_shader_compilation) && REXCVAR_GET(vulkan_async_shaders_nonblocking) &&
+         !creation_threads_.empty() && !translation_threads_.empty();
+}
+
+VulkanPipelineCache::TranslationRequestResult VulkanPipelineCache::RequestShadersTranslated(
+    VulkanShader::VulkanTranslation* vertex_shader,
+    VulkanShader::VulkanTranslation* pixel_shader) {
+  using AsyncState = VulkanShader::VulkanTranslation::AsyncState;
+  auto request = [this](VulkanShader::VulkanTranslation& translation) {
+    AsyncState state = translation.async_state().load(std::memory_order_acquire);
+    if (state == AsyncState::kNone) {
+      if (translation.is_translated()) {
+        // Translated on this thread before (storage loading or blocking mode).
+        state = translation.is_valid() && translation.shader_module() != VK_NULL_HANDLE
+                    ? AsyncState::kDone
+                    : AsyncState::kFailed;
+        translation.async_state().store(state, std::memory_order_relaxed);
+      } else {
+        translation.async_state().store(AsyncState::kQueued, std::memory_order_relaxed);
+        size_t thread_index =
+            size_t(translation.shader().ucode_data_hash() % translation_queues_.size());
+        {
+          std::lock_guard<std::mutex> lock(translation_request_lock_);
+          translation_queues_[thread_index].push_back(&translation);
+          ++translation_pending_count_;
+        }
+        translation_request_cond_.notify_all();
+        return TranslationRequestResult::kPending;
+      }
+    }
+    switch (state) {
+      case AsyncState::kDone:
+        return TranslationRequestResult::kReady;
+      case AsyncState::kFailed:
+        return TranslationRequestResult::kFailed;
+      default:
+        return TranslationRequestResult::kPending;
+    }
+  };
+  TranslationRequestResult vertex_result = request(*vertex_shader);
+  TranslationRequestResult pixel_result =
+      pixel_shader ? request(*pixel_shader) : TranslationRequestResult::kReady;
+  if (vertex_result == TranslationRequestResult::kFailed ||
+      pixel_result == TranslationRequestResult::kFailed) {
+    return TranslationRequestResult::kFailed;
+  }
+  if (vertex_result == TranslationRequestResult::kPending ||
+      pixel_result == TranslationRequestResult::kPending) {
+    return TranslationRequestResult::kPending;
+  }
+  SetUpShaderBindingLayoutUIDs(static_cast<VulkanShader&>(vertex_shader->shader()));
+  if (pixel_shader) {
+    SetUpShaderBindingLayoutUIDs(static_cast<VulkanShader&>(pixel_shader->shader()));
+  }
+  return TranslationRequestResult::kReady;
+}
+
+void VulkanPipelineCache::TranslationThread(size_t thread_index) {
+  using AsyncState = VulkanShader::VulkanTranslation::AsyncState;
+  SpirvShaderTranslator& translator = *translation_thread_translators_[thread_index];
+  while (true) {
+    VulkanShader::VulkanTranslation* translation;
+    {
+      std::unique_lock<std::mutex> lock(translation_request_lock_);
+      translation_request_cond_.wait(lock, [this, thread_index] {
+        return translation_threads_shutdown_ || !translation_queues_[thread_index].empty();
+      });
+      if (translation_threads_shutdown_) {
+        return;
+      }
+      translation = translation_queues_[thread_index].front();
+      translation_queues_[thread_index].pop_front();
+    }
+    bool translated = translator.TranslateAnalyzedShader(*translation) &&
+                      translation->GetOrCreateShaderModule() != VK_NULL_HANDLE;
+    if (!translated) {
+      REXGPU_ERROR("Shader {:016X} background translation failed; marking as ignored",
+                   translation->shader().ucode_data_hash());
+    }
+    translation->async_state().store(translated ? AsyncState::kDone : AsyncState::kFailed,
+                                     std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(translation_request_lock_);
+      --translation_pending_count_;
+    }
+    translation_completion_cond_.notify_all();
+  }
+}
+
+void VulkanPipelineCache::WaitForTranslationThreadsIdle() {
+  std::unique_lock<std::mutex> lock(translation_request_lock_);
+  translation_completion_cond_.wait(lock, [this] { return translation_pending_count_ == 0; });
 }
 
 void VulkanPipelineCache::WritePipelineRenderTargetDescription(

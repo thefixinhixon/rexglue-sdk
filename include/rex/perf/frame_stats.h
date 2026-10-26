@@ -71,6 +71,10 @@ class FrameStatsScope {
     // Sub-divisions of the command processor time.
     kDraw,
     kBarriers,
+    // Pipeline cache work done on the command processor thread.
+    kShaderTranslate,
+    kPlaceholderPipeline,
+    kSyncPipeline,
   };
 
   explicit FrameStatsScope(Sink sink);

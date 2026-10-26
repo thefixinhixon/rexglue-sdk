@@ -58,6 +58,11 @@ struct Accumulators {
   std::atomic<uint64_t> barrier_batches{0};
   std::atomic<uint64_t> draw_us{0};
   std::atomic<uint64_t> barrier_us{0};
+  // Pipeline cache work on the command processor thread: translations,
+  // placeholder pipelines, pipelines created synchronously.
+  std::atomic<uint64_t> pipeline_count[3];
+  std::atomic<uint64_t> pipeline_us[3];
+  std::atomic<uint64_t> pipeline_max_us[3];
   // Type 3 opcode is 7 bits wide.
   std::atomic<uint64_t> packet_us[128];
 };
@@ -127,6 +132,12 @@ void MaybeLog() {
   for (uint32_t i = 0; i < 128; ++i) {
     packet_us[i] = g_acc.packet_us[i].exchange(0, std::memory_order_relaxed);
   }
+  uint64_t pipeline_count[3], pipeline_us[3], pipeline_max_us[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    pipeline_count[i] = g_acc.pipeline_count[i].exchange(0, std::memory_order_relaxed);
+    pipeline_us[i] = g_acc.pipeline_us[i].exchange(0, std::memory_order_relaxed);
+    pipeline_max_us[i] = g_acc.pipeline_max_us[i].exchange(0, std::memory_order_relaxed);
+  }
   logging.store(false, std::memory_order_release);
 
   double seconds = static_cast<double>(elapsed_us) / 1000000.0;
@@ -178,6 +189,14 @@ void MaybeLog() {
   }
   if (!packets.empty()) {
     REXLOG_INFO("[sh-perf] cp packets per frame: {}", packets);
+  }
+  if (pipeline_count[0] || pipeline_count[1] || pipeline_count[2]) {
+    REXLOG_INFO(
+        "[sh-perf] cp pipeline work: translate {} {:.1f}ms (max {:.1f}) | placeholder {} "
+        "{:.1f}ms (max {:.1f}) | sync create {} {:.1f}ms (max {:.1f})",
+        pipeline_count[0], pipeline_us[0] / 1000.0, pipeline_max_us[0] / 1000.0,
+        pipeline_count[1], pipeline_us[1] / 1000.0, pipeline_max_us[1] / 1000.0,
+        pipeline_count[2], pipeline_us[2] / 1000.0, pipeline_max_us[2] / 1000.0);
   }
 }
 
@@ -334,6 +353,19 @@ FrameStatsScope::~FrameStatsScope() {
       g_acc.draw_us.fetch_add(static_cast<uint64_t>(milliseconds * 1000.0),
                               std::memory_order_relaxed);
       break;
+    case Sink::kShaderTranslate:
+    case Sink::kPlaceholderPipeline:
+    case Sink::kSyncPipeline: {
+      uint32_t i = uint32_t(sink_) - uint32_t(Sink::kShaderTranslate);
+      uint64_t us = static_cast<uint64_t>(milliseconds * 1000.0);
+      g_acc.pipeline_count[i].fetch_add(1, std::memory_order_relaxed);
+      g_acc.pipeline_us[i].fetch_add(us, std::memory_order_relaxed);
+      uint64_t prev = g_acc.pipeline_max_us[i].load(std::memory_order_relaxed);
+      while (us > prev &&
+             !g_acc.pipeline_max_us[i].compare_exchange_weak(prev, us, std::memory_order_relaxed)) {
+      }
+      break;
+    }
     case Sink::kBarriers:
       g_acc.barrier_us.fetch_add(static_cast<uint64_t>(milliseconds * 1000.0),
                                  std::memory_order_relaxed);

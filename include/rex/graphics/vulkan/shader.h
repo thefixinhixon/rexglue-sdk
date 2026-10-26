@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 
 #include <rex/graphics/pipeline/shader/spirv.h>
@@ -29,8 +30,15 @@ class VulkanShader : public SpirvShader {
     VkShaderModule GetOrCreateShaderModule();
     VkShaderModule shader_module() const { return shader_module_; }
 
+    // Background translation (VulkanPipelineCache::RequestShadersTranslated).
+    // kDone/kFailed are stored with release ordering after everything the
+    // translation thread wrote, so acquiring them makes the result visible.
+    enum class AsyncState : uint8_t { kNone, kQueued, kDone, kFailed };
+    std::atomic<AsyncState>& async_state() { return async_state_; }
+
    private:
     VkShaderModule shader_module_ = VK_NULL_HANDLE;
+    std::atomic<AsyncState> async_state_{AsyncState::kNone};
   };
 
   explicit VulkanShader(const ui::vulkan::VulkanDevice* vulkan_device,
