@@ -19,6 +19,8 @@
  */
 #include <rex/perf/frame_stats.h>
 
+#include <fmt/format.h>
+
 #include <atomic>
 #include <cinttypes>
 
@@ -31,6 +33,8 @@ REXCVAR_DEFINE_BOOL(sh_perf_log, false, "Performance",
 REXCVAR_DEFINE_INT32(sh_perf_log_interval_ms, 2000, "Performance",
                      "Interval between [sh-perf] statistics lines, in milliseconds")
     .range(100, 60000);
+REXCVAR_DEFINE_BOOL(sh_perf_log_packets, false, "Performance",
+                    "Also time every PM4 packet for [sh-perf] (adds measurable overhead)");
 
 namespace rex::perf {
 
@@ -44,13 +48,24 @@ struct Accumulators {
   std::atomic<uint64_t> gpu_wait_us{0};
   std::atomic<uint64_t> swap_us{0};
   std::atomic<uint64_t> present_us{0};
+  std::atomic<uint64_t> paints{0};
+  std::atomic<uint64_t> expose_paints{0};
+  std::atomic<uint64_t> submits{0};
+  std::atomic<uint64_t> submit_us{0};
+  std::atomic<uint64_t> queue_wait_us{0};
+  std::atomic<uint64_t> paint_requests[8];
+  std::atomic<uint64_t> render_passes{0};
+  std::atomic<uint64_t> barrier_batches{0};
+  std::atomic<uint64_t> draw_us{0};
+  std::atomic<uint64_t> barrier_us{0};
+  // Type 3 opcode is 7 bits wide.
+  std::atomic<uint64_t> packet_us[128];
 };
 
 Accumulators g_acc;
 
 std::atomic<bool> g_enabled{false};
 std::atomic<uint64_t> g_last_log_tick{0};
-std::atomic<uint64_t> g_total_presents{0};
 
 uint64_t ToMicroseconds(uint64_t ticks) {
   uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
@@ -90,20 +105,80 @@ void MaybeLog() {
   uint64_t gpu_wait_us = g_acc.gpu_wait_us.exchange(0, std::memory_order_relaxed);
   uint64_t swap_us = g_acc.swap_us.exchange(0, std::memory_order_relaxed);
   uint64_t present_us = g_acc.present_us.exchange(0, std::memory_order_relaxed);
+  uint64_t paints = g_acc.paints.exchange(0, std::memory_order_relaxed);
+  uint64_t expose_paints = g_acc.expose_paints.exchange(0, std::memory_order_relaxed);
+  uint64_t submits = g_acc.submits.exchange(0, std::memory_order_relaxed);
+  uint64_t submit_us = g_acc.submit_us.exchange(0, std::memory_order_relaxed);
+  uint64_t queue_wait_us = g_acc.queue_wait_us.exchange(0, std::memory_order_relaxed);
+  uint64_t req_guest =
+      g_acc.paint_requests[0].exchange(0, std::memory_order_relaxed);
+  uint64_t req_ui = g_acc.paint_requests[1].exchange(0, std::memory_order_relaxed);
+  uint64_t req_surface = g_acc.paint_requests[2].exchange(0, std::memory_order_relaxed);
+  uint64_t req_self_tick = g_acc.paint_requests[3].exchange(0, std::memory_order_relaxed);
+  uint64_t req_self_imm = g_acc.paint_requests[4].exchange(0, std::memory_order_relaxed);
+  uint64_t req_other = g_acc.paint_requests[5].exchange(0, std::memory_order_relaxed);
+  uint64_t req_ui_paint = g_acc.paint_requests[6].exchange(0, std::memory_order_relaxed);
+  uint64_t req_drawers_paint = g_acc.paint_requests[7].exchange(0, std::memory_order_relaxed);
+  uint64_t render_passes = g_acc.render_passes.exchange(0, std::memory_order_relaxed);
+  uint64_t barrier_batches = g_acc.barrier_batches.exchange(0, std::memory_order_relaxed);
+  uint64_t draw_us = g_acc.draw_us.exchange(0, std::memory_order_relaxed);
+  uint64_t barrier_us = g_acc.barrier_us.exchange(0, std::memory_order_relaxed);
+  uint64_t packet_us[128];
+  for (uint32_t i = 0; i < 128; ++i) {
+    packet_us[i] = g_acc.packet_us[i].exchange(0, std::memory_order_relaxed);
+  }
   logging.store(false, std::memory_order_release);
 
   double seconds = static_cast<double>(elapsed_us) / 1000000.0;
   double frames = static_cast<double>(guest_swaps ? guest_swaps : 1);
   REXLOG_INFO(
-      "[sh-perf] {:.2f}s guest {:.1f}/s host {:.1f}/s | swap {:.2f}ms present {:.2f}ms "
-      "cp {:.2f}ms/frame gpu_wait {:.2f}ms/frame | draws {:.0f}/frame",
+      "[sh-perf] {:.2f}s guest {:.1f}/s host {:.1f}/s paints {:.1f}/s expose {:.1f}/s | "
+      "req g{:.1f} u{:.1f} s{:.1f} st{:.1f} si{:.1f} o{:.1f} up{:.1f} dp{:.1f} | "
+      "swap {:.2f}ms present {:.2f}ms cp {:.2f}ms/frame gpu_wait {:.2f}ms/frame | "
+      "draws {:.0f}/frame passes {:.0f} barriers {:.0f} submits {:.1f}/frame "
+      "submit {:.2f}ms qwait {:.2f}ms/frame | draw {:.2f}ms bar {:.2f}ms",
       seconds, static_cast<double>(guest_swaps) / seconds,
-      static_cast<double>(presents) / seconds,
+      static_cast<double>(presents) / seconds, static_cast<double>(paints) / seconds,
+      static_cast<double>(expose_paints) / seconds,
+      static_cast<double>(req_guest) / seconds, static_cast<double>(req_ui) / seconds,
+      static_cast<double>(req_surface) / seconds, static_cast<double>(req_self_tick) / seconds,
+      static_cast<double>(req_self_imm) / seconds, static_cast<double>(req_other) / seconds,
+      static_cast<double>(req_ui_paint) / seconds,
+      static_cast<double>(req_drawers_paint) / seconds,
       static_cast<double>(swap_us) / frames / 1000.0,
       presents ? static_cast<double>(present_us) / static_cast<double>(presents) / 1000.0 : 0.0,
       static_cast<double>(cp_us) / frames / 1000.0,
       static_cast<double>(gpu_wait_us) / frames / 1000.0,
-      static_cast<double>(draws) / frames);
+      static_cast<double>(draws) / frames, static_cast<double>(render_passes) / frames,
+      static_cast<double>(barrier_batches) / frames, static_cast<double>(submits) / frames,
+      submits ? static_cast<double>(submit_us) / static_cast<double>(submits) / 1000.0 : 0.0,
+      static_cast<double>(queue_wait_us) / frames / 1000.0,
+      static_cast<double>(draw_us) / frames / 1000.0,
+      static_cast<double>(barrier_us) / frames / 1000.0);
+
+  // The most expensive packet types, as a second line to keep the first one
+  // readable. Opcode numbers are the PM4 Type 3 opcodes (hex).
+  std::string packets;
+  for (uint32_t entry = 0; entry < 5; ++entry) {
+    uint32_t best = 128;
+    for (uint32_t i = 0; i < 128; ++i) {
+      if (!packet_us[i]) {
+        continue;
+      }
+      if (best == 128 || packet_us[i] > packet_us[best]) {
+        best = i;
+      }
+    }
+    if (best == 128) {
+      break;
+    }
+    packets += fmt::format("{}{:#04x} {:.2f}ms", entry ? " " : "", best,
+                           static_cast<double>(packet_us[best]) / frames / 1000.0);
+    packet_us[best] = 0;
+  }
+  if (!packets.empty()) {
+    REXLOG_INFO("[sh-perf] cp packets per frame: {}", packets);
+  }
 }
 
 void RefreshEnabled() {
@@ -174,6 +249,64 @@ void FrameStatsDraws(uint32_t count) {
   g_acc.draws.fetch_add(count, std::memory_order_relaxed);
 }
 
+void FrameStatsPaint(bool forced_by_expose) {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.paints.fetch_add(1, std::memory_order_relaxed);
+  if (forced_by_expose) {
+    g_acc.expose_paints.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void FrameStatsPaintRequest(PaintRequestSource source) {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.paint_requests[static_cast<uint32_t>(source)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void FrameStatsRenderPass() {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.render_passes.fetch_add(1, std::memory_order_relaxed);
+}
+
+void FrameStatsBarrierBatch() {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.barrier_batches.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool FrameStatsPacketTimingEnabled() {
+  return g_enabled.load(std::memory_order_relaxed) && REXCVAR_GET(sh_perf_log_packets);
+}
+
+void FrameStatsPacketTime(uint32_t opcode, double ms) {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.packet_us[opcode & 127].fetch_add(static_cast<uint64_t>(ms * 1000.0),
+                                          std::memory_order_relaxed);
+}
+
+void FrameStatsQueueWait(double wait_ms) {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.queue_wait_us.fetch_add(static_cast<uint64_t>(wait_ms * 1000.0), std::memory_order_relaxed);
+}
+
+void FrameStatsSubmit(double cost_ms) {
+  if (!g_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_acc.submits.fetch_add(1, std::memory_order_relaxed);
+  g_acc.submit_us.fetch_add(static_cast<uint64_t>(cost_ms * 1000.0), std::memory_order_relaxed);
+}
+
 FrameStatsScope::FrameStatsScope(Sink sink) : sink_(sink) {
   RefreshEnabled();
   active_ = g_enabled.load(std::memory_order_relaxed);
@@ -196,6 +329,14 @@ FrameStatsScope::~FrameStatsScope() {
       break;
     case Sink::kGpuWait:
       FrameStatsGpuWait(milliseconds);
+      break;
+    case Sink::kDraw:
+      g_acc.draw_us.fetch_add(static_cast<uint64_t>(milliseconds * 1000.0),
+                              std::memory_order_relaxed);
+      break;
+    case Sink::kBarriers:
+      g_acc.barrier_us.fetch_add(static_cast<uint64_t>(milliseconds * 1000.0),
+                                 std::memory_order_relaxed);
       break;
   }
 }

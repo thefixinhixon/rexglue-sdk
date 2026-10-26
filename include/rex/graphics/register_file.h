@@ -36,6 +36,9 @@ class RegisterFile {
   RegisterFile();
 
   static const RegisterInfo* GetRegisterInfo(uint32_t index);
+  // Same answer as GetRegisterInfo(index) != nullptr, but a table lookup
+  // instead of a switch over every known register (called per register write).
+  static bool IsKnownRegister(uint32_t index);
 
   static constexpr size_t kRegisterCount = 0x5003;
   uint32_t values[kRegisterCount];

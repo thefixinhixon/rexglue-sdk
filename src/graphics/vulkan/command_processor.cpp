@@ -24,6 +24,7 @@
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -3056,6 +3057,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
 
 bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   assert_true(submission_open_);
+  rex::perf::FrameStatsScope barrier_scope(rex::perf::FrameStatsScope::Sink::kBarriers);
   SplitPendingBarrier();
   if (pending_barriers_.empty()) {
     if (force_end_render_pass) {
@@ -3064,6 +3066,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
     return false;
   }
   EndRenderPass();
+  rex::perf::FrameStatsBarrierBatch();
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
@@ -3144,6 +3147,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
     rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
+    rex::perf::FrameStatsRenderPass();
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -3161,6 +3165,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
+  rex::perf::FrameStatsRenderPass();
   in_render_pass_ = true;
 }
 
@@ -3238,6 +3243,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
     rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
+    rex::perf::FrameStatsRenderPass();
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -3253,6 +3259,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
+  rex::perf::FrameStatsRenderPass();
   in_render_pass_ = true;
 }
 
@@ -3597,6 +3604,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   rex::perf::FrameStatsDraws(1);
+  rex::perf::FrameStatsScope draw_scope(rex::perf::FrameStatsScope::Sink::kDraw);
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
@@ -5423,9 +5431,17 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     VkResult submit_result;
     {
+      uint64_t acquire_start = rex::chrono::Clock::QueryHostTickCount();
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      uint64_t submit_start = rex::chrono::Clock::QueryHostTickCount();
+      rex::perf::FrameStatsQueueWait(
+          static_cast<double>(submit_start - acquire_start) * 1000.0 /
+          static_cast<double>(rex::chrono::Clock::QueryHostTickFrequency()));
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+      rex::perf::FrameStatsSubmit(
+          static_cast<double>(rex::chrono::Clock::QueryHostTickCount() - submit_start) * 1000.0 /
+          static_cast<double>(rex::chrono::Clock::QueryHostTickFrequency()));
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");

@@ -356,7 +356,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!regs.IsKnownRegister(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -754,6 +754,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
+  uint64_t packet_start_tick = rex::perf::FrameStatsPacketTimingEnabled()
+                                  ? rex::chrono::Clock::QueryHostTickCount()
+                                  : 0;
   bool result = false;
   switch (opcode) {
     case PM4_ME_INIT:
@@ -886,6 +889,12 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       assert_always();
       reader->AdvanceRead(count * sizeof(uint32_t));
       break;
+  }
+
+  if (packet_start_tick) {
+    rex::perf::FrameStatsPacketTime(
+        opcode, static_cast<double>(rex::chrono::Clock::QueryHostTickCount() - packet_start_tick) *
+                    1000.0 / static_cast<double>(rex::chrono::Clock::QueryHostTickFrequency()));
   }
 
   assert_true(reader->read_offset() ==

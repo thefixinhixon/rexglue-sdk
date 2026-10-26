@@ -859,6 +859,9 @@ class Presenter {
   }
   void UpdateUITicksNeededFromUIThread();
   void WaitForUITickFromUIThread();
+  // Bumped by RefreshGuestOutput (the guest output thread) so the UI thread can
+  // tell a repaint of a new guest frame from a purely UI one.
+  std::atomic<uint64_t> guest_output_refresh_count_{0};
   // May be called from any thread.
   void ForceUIThreadPaintTick();
 
@@ -1051,6 +1054,12 @@ class Presenter {
 
   std::thread dxgi_ui_tick_thread_;
 #endif  // XE_PLATFORM
+
+  // Without DXGI there is no vertical blanking interval to wait for, so the UI
+  // paint loop is paced with a deadline instead (see
+  // WaitForUITickFromUIThread). Accessible only from the UI thread.
+  int64_t ui_tick_next_us_ = 0;
+  uint64_t ui_tick_last_painted_refresh_count_ = 0;
 };
 
 }  // namespace ui

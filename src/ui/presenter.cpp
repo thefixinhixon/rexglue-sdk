@@ -17,6 +17,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/platform.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -35,6 +36,11 @@ REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
 REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
                      "Horizontal safe area percentage (0-100)")
     .range(0, 100);
+
+REXCVAR_DEFINE_INT32(present_ui_tick_hz, 60, "UI/Presenter",
+                     "Maximum rate of UI-only repaints where the host surface has no vertical "
+                     "sync to wait for (0 = unlimited)")
+    .range(0, 1000);
 
 REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
@@ -411,6 +417,7 @@ void Presenter::OnSurfaceResizeFromUIThread() {
 
   // Request to repaint as soon as possible in the UI thread if needed.
   if (request_repaint) {
+    rex::perf::FrameStatsPaintRequest(rex::perf::PaintRequestSource::kSurfaceChange);
     RequestPaintOrConnectionRecoveryViaWindow(true);
   }
 }
@@ -542,6 +549,9 @@ void Presenter::PaintFromUIThread(bool force_paint) {
     }
   }
   if (request_repaint_at_tick || request_repaint_immediately) {
+    rex::perf::FrameStatsPaintRequest(request_repaint_at_tick
+                                          ? rex::perf::PaintRequestSource::kSelfTick
+                                          : rex::perf::PaintRequestSource::kSelfImmediate);
     RequestPaintOrConnectionRecoveryViaWindow(request_repaint_immediately);
   }
 }
@@ -550,6 +560,7 @@ bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  guest_output_refresh_count_.fetch_add(1, std::memory_order_relaxed);
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -623,6 +634,7 @@ bool Presenter::RefreshGuestOutput(
         break;
       case PaintMode::kUIThreadOnRequest:
         // Only window paint requesting is accessible.
+        rex::perf::FrameStatsPaintRequest(rex::perf::PaintRequestSource::kGuestOutput);
         RequestPaintOrConnectionRecoveryViaWindow(true);
         break;
       case PaintMode::kGuestOutputThreadImmediately:
@@ -772,6 +784,7 @@ void Presenter::RequestUIPaintFromUIThread() {
     // according to the actual state at the moment that happens. It's common for
     // drawers to call this (even every frame), and no need to do too many OS
     // paint request calls.
+    rex::perf::FrameStatsPaintRequest(rex::perf::PaintRequestSource::kUIDrawerInPaint);
     request_ui_paint_after_current_ui_thread_paint_ = true;
     return;
   }
@@ -781,6 +794,7 @@ void Presenter::RequestUIPaintFromUIThread() {
   if (!ui_drawers_.empty() && paint_mode_ != PaintMode::kNone) {
     // The window must be present, otherwise the conditions wouldn't have been
     // met.
+    rex::perf::FrameStatsPaintRequest(rex::perf::PaintRequestSource::kUIDrawer);
     window_->RequestPaint();
   }
 }
@@ -1525,6 +1539,7 @@ void Presenter::HandleUIDrawersChangeFromUIThread(bool drawers_were_empty) {
     // Defer the refresh so no dangerous lifecycle-related changes happen during
     // drawing.
     if (!ui_drawers_.empty()) {
+      rex::perf::FrameStatsPaintRequest(rex::perf::PaintRequestSource::kDrawersChangeInPaint);
       request_ui_paint_after_current_ui_thread_paint_ = true;
     }
     return;
@@ -1577,7 +1592,39 @@ void Presenter::UpdateUITicksNeededFromUIThread() {
 }
 
 void Presenter::WaitForUITickFromUIThread() {
-#if REX_PLATFORM_WIN32
+#if !REX_PLATFORM_WIN32
+  // SDL has no IDXGIOutput::WaitForVBlank. Drawers (the achievement toast is
+  // always attached, so there is always one) ask for another repaint at the end
+  // of every paint pass, so without a limiter the UI thread presents as fast as
+  // it can - hundreds of presents per second of an unchanged image, each one a
+  // full host present. Show a new guest frame immediately, and pace repaints
+  // that only refresh the UI to the configured rate.
+  if (!AreUITicksNeededFromUIThread()) {
+    return;
+  }
+  uint32_t tick_hz = uint32_t(REXCVAR_GET(present_ui_tick_hz));
+  int64_t period_us = tick_hz ? std::max<int64_t>(int64_t(1), 1000000 / int64_t(tick_hz)) : 0;
+  auto host_time_us = []() -> int64_t {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  int64_t now_us = host_time_us();
+  uint64_t refreshes = guest_output_refresh_count_.load(std::memory_order_relaxed);
+  if (refreshes != ui_tick_last_painted_refresh_count_) {
+    ui_tick_last_painted_refresh_count_ = refreshes;
+    ui_tick_next_us_ = now_us + period_us;
+    return;
+  }
+  if (!period_us) {
+    return;
+  }
+  if (ui_tick_next_us_ > now_us) {
+    std::this_thread::sleep_for(std::chrono::microseconds(ui_tick_next_us_ - now_us));
+    now_us = host_time_us();
+  }
+  ui_tick_next_us_ = std::max(ui_tick_next_us_ + period_us, now_us);
+#else
   if (!AreUITicksNeededFromUIThread()) {
     return;
   }

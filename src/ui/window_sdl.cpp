@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/sdl_virtual_key.h>
@@ -428,6 +429,7 @@ void WindowSDL::RequestPaintImpl() {
   if (paint_pending_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
+  rex::perf::FrameStatsPaintRequest(rex::perf::PaintRequestSource::kOther);
   SDL_Event event{};
   event.type = sdl_app_context().paint_event_type();
   event.user.windowID = sdl_window_id_;
@@ -481,6 +483,7 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
       break;
     case SDL_EVENT_WINDOW_EXPOSED:
       // The platform cannot retain the previous image; force the paint.
+      rex::perf::FrameStatsPaint(true);
       OnPaint(true);
       break;
     case SDL_EVENT_WINDOW_MINIMIZED:

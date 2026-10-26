@@ -15,6 +15,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_stats.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -623,6 +624,7 @@ void Window::OnPaint(bool force_paint) {
   }
   is_painting_ = true;
   if (presenter_surface_) {
+    rex::perf::FrameStatsPaint(false);
     presenter_->PaintFromUIThread(force_paint);
   }
   is_painting_ = false;

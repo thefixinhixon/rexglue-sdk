@@ -27,6 +27,39 @@ void FrameStatsSwapCost(double swap_ms);
 void FrameStatsPresent(double present_ms);
 // Draw calls issued to the host GPU.
 void FrameStatsDraws(uint32_t count);
+// Render passes begun and barrier batches submitted by the command processor.
+void FrameStatsRenderPass();
+void FrameStatsBarrierBatch();
+// Time spent executing one PM4 Type 3 opcode, keyed by the opcode itself.
+void FrameStatsPacketTime(uint32_t opcode, double ms);
+// Whether per-packet timing should be collected at all (two clock queries per
+// packet, so it is a separate opt-in on top of the log).
+bool FrameStatsPacketTimingEnabled();
+// Window paint passes started from the UI thread, and how many of them were
+// forced by a window expose event.
+void FrameStatsPaint(bool forced_by_expose);
+
+enum class PaintRequestSource : uint32_t {
+  // A guest frame was refreshed and needs to be shown.
+  kGuestOutput = 0,
+  // A UI drawer (ImGui) asked to be redrawn.
+  kUIDrawer = 1,
+  // The surface, its monitor or its size changed.
+  kSurfaceChange = 2,
+  // A paint requested itself another paint at the end of the pass.
+  kSelfTick = 3,
+  kSelfImmediate = 4,
+  // Any other path, counted where the window paint event is actually queued.
+  kOther = 5,
+  // Requests deferred to the end of the current paint pass.
+  kUIDrawerInPaint = 6,
+  kDrawersChangeInPaint = 7,
+};
+void FrameStatsPaintRequest(PaintRequestSource source);
+// Host submissions (vkQueueSubmit of a command buffer).
+void FrameStatsSubmit(double cost_ms);
+// Time the command processor waited for the host queue (held by the presenter).
+void FrameStatsQueueWait(double wait_ms);
 
 // RAII timer reporting the elapsed time to one of the accumulators.
 class FrameStatsScope {
@@ -35,6 +68,9 @@ class FrameStatsScope {
     kSwapCost,
     kCommandProcessor,
     kGpuWait,
+    // Sub-divisions of the command processor time.
+    kDraw,
+    kBarriers,
   };
 
   explicit FrameStatsScope(Sink sink);
