@@ -111,6 +111,13 @@ if(WIN32)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# rexui is linked PRIVATE, so re-export the defines that shape its public
+# Presenter headers (see src/ui/CMakeLists.txt).
+target_compile_definitions(rexruntime PUBLIC REX_HAS_FIDELITYFX_SDK=1)
+if(REXUI_HAS_FIDELITYFX_RUNTIME)
+    target_compile_definitions(rexruntime PUBLIC REX_HAS_FIDELITYFX_RUNTIME=1)
+endif()
+
 if(REXGLUE_USE_D3D12)
     target_link_libraries(rexruntime PUBLIC dxc-headers)
     target_compile_definitions(rexruntime PUBLIC REX_HAS_D3D12=1)

@@ -124,8 +124,10 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
 endif()
 # The spatial CAS/FSR presenter effects use the precompiled shaders in
 # src/ui/shaders and need neither the FidelityFX SDK nor its runtime; only the
-# temporal fsr2/fsr3 path does (REX_HAS_FIDELITYFX_RUNTIME).
-target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+# temporal fsr2/fsr3 path does (REX_HAS_FIDELITYFX_RUNTIME). Both defines change
+# the Presenter classes in the public headers, so every consumer must see them
+# (rexruntime re-exports them, src/system/CMakeLists.txt).
+target_compile_definitions(rexui PUBLIC REX_HAS_FIDELITYFX_SDK=1)
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
 if(TARGET amd_fidelityfx_vk)
@@ -137,8 +139,9 @@ if(TARGET amd_fidelityfx_dx12)
     set(REXUI_HAS_FIDELITYFX_RUNTIME ON)
 endif()
 if(REXUI_HAS_FIDELITYFX_RUNTIME)
-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_RUNTIME=1)
+    target_compile_definitions(rexui PUBLIC REX_HAS_FIDELITYFX_RUNTIME=1)
 endif()
+set(REXUI_HAS_FIDELITYFX_RUNTIME ${REXUI_HAS_FIDELITYFX_RUNTIME} PARENT_SCOPE)
 
 if(REXGLUE_USE_VULKAN)
     target_link_libraries(rexui PUBLIC
